@@ -1,0 +1,45 @@
+[project]
+name = "clearervoicestudio-target-speaker-extraction"
+version = "0.1.0"
+description = "Training environment for ClearerVoice-Studio target speaker extraction models"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "gdown==5.2.0",
+    "huggingface-hub==0.26.2",
+    "librosa==0.10.2.post1",
+    "mir_eval==0.7",
+    "numpy==1.24.3",
+    "opencv-python==4.10.0.84",
+    "pesq==0.0.4",
+    "protobuf==3.20.3",
+    "pystoi==0.4.1",
+    "python-dotenv==1.0.1",
+    "python_speech_features==0.6",
+    "rotary-embedding-torch==0.8.3",
+    "scipy==1.10.1",
+    "setuptools<81",
+    "soundfile==0.12.1",
+    "tensorboard==2.14.0",
+    'torch==2.9.0+cu130',
+    'torchvision==0.24.0+cu130',
+    'torchaudio==2.9.0+cu130',
+    #"torch==2.4.1",
+    "torch-complex==0.4.4",
+    #"torchaudio==2.4.1",
+    #"torchvision==0.19.1",
+    "tqdm==4.66.5",
+    "typeguard==4.3.0",
+    "yamlargparse==1.31.1"
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+ms-swift = { path = "vendor/ms_swift-3.11.0.dev0-py3-none-any.whl" }
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }

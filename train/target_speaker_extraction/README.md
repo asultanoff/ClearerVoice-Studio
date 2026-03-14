@@ -35,6 +35,33 @@ conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1  pytorch-cuda
 pip install -r requirements.txt
 ```
 
+Alternative with `uv`:
+
+``` sh
+cd ClearerVoice-Studio/train/target_speaker_extraction/
+uv sync
+uv run bash train.sh
+```
+
+You can also launch training directly without the shell wrapper:
+
+``` sh
+uv run python train.py --config config/config_custom_speech_SpEx-plus_onthefly.yaml --checkpoint_dir checkpoints/log_custom --train_from_last_checkpoint 0
+```
+
+To automatically push the final checkpoint directory to Hugging Face Hub after training, either set `hf_repo_id` in the config/CLI or provide `HF_REPO` in a `.env` file:
+
+``` sh
+cat > .env <<'EOF'
+HF_REPO=your-org/your-model
+HF_TOKEN=hf_...
+EOF
+
+uv run python train.py --config config/config_custom_speech_SpEx-plus_onthefly.yaml --checkpoint_dir checkpoints/log_custom
+```
+
+The repo is created as private by default; override with `--hf_private 0` if needed.
+
 3. **Download Dataset**
 > Follow the download links or preprocessing scripts provided under each task section.
 

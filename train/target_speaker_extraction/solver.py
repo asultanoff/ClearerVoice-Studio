@@ -1,10 +1,13 @@
 import time
+from contextlib import nullcontext
+
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import numpy as np
+from tqdm.auto import tqdm
 
 from losses.loss_function import loss_wrapper
 from losses.metrics import SDR, cal_SISNR
@@ -16,9 +19,15 @@ class Solver(object):
         self.train_data = train_data
         self.validation_data = validation_data
         self.test_data = test_data
+        self.use_test_for_validation = validation_data is None
         self.args = args
 
         self.loss = loss_wrapper(args.loss_type)
+        self.precision = (getattr(args, 'precision', 'fp32') or 'fp32').lower()
+        if self.precision not in ['fp32', 'bf16']:
+            raise ValueError(f'Unsupported precision "{self.precision}". Use fp32 or bf16.')
+        self.use_autocast = self.precision == 'bf16' and self.args.device.type == 'cuda'
+        self.autocast_dtype = torch.bfloat16 if self.use_autocast else None
 
         self.print = False
         if (self.args.distributed and self.args.local_rank ==0) or not self.args.distributed:
@@ -39,6 +48,7 @@ class Solver(object):
     def _init(self):
         self.halving = False
         self.step_num = 1
+        self.optim_step = 0
         self.best_val_loss = float("inf")
         self.val_no_impv = 0
         self.start_epoch=1
@@ -76,6 +86,7 @@ class Solver(object):
         if load_training_stat:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
             self.step_num = checkpoint['step_num']
+            self.optim_step = checkpoint.get('optim_step', 0)
             self.best_val_loss = checkpoint['best_val_loss']
             self.val_no_impv = checkpoint['val_no_impv']
             self.start_epoch=checkpoint['epoch']
@@ -88,9 +99,41 @@ class Solver(object):
                             'optimizer': self.optimizer.state_dict(),
                             'epoch': self.epoch+1,
                             'step_num': self.step_num,
+                            'optim_step': self.optim_step,
                             'best_val_loss': self.best_val_loss,
                             'val_no_impv': self.val_no_impv}
             torch.save(checkpoint, path)
+
+    def _to_float(self, value):
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu())
+        return float(value)
+
+    def _autocast_context(self):
+        if not self.use_autocast:
+            return nullcontext()
+        return torch.autocast(device_type=self.args.device.type, dtype=self.autocast_dtype)
+
+    def _to_loss_precision(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point():
+                return value.float()
+            return value
+        if isinstance(value, tuple):
+            return tuple(self._to_loss_precision(item) for item in value)
+        if isinstance(value, list):
+            return [self._to_loss_precision(item) for item in value]
+        return value
+
+    def _current_lr(self):
+        return self.optimizer.param_groups[0]['lr']
+
+    def _log_optimizer_step(self, loss_value, grad_norm):
+        self.optim_step += 1
+        if self.print:
+            self.writer.add_scalar('Train/Loss_step', loss_value, self.optim_step)
+            self.writer.add_scalar('Train/Learning_rate_step', self._current_lr(), self.optim_step)
+            self.writer.add_scalar('Train/Grad_norm_step', grad_norm, self.optim_step)
         
     def _print_lr(self):
         optim_state = self.optimizer.state_dict()
@@ -113,30 +156,36 @@ class Solver(object):
             # Train
             self.model.train()
             start = time.time()
-            tr_loss = self._run_one_epoch(data_loader = self.train_data)
+            tr_loss, train_stats = self._run_one_epoch(data_loader=self.train_data)
             if self.args.distributed: tr_loss = self._reduce_tensor(tr_loss)
             if self.print: print('Train Summary | End of Epoch {0} | Time {1:.2f}s | ''Train Loss {2:.3f}'.format(self.epoch, time.time() - start, tr_loss))
 
             # Validation
             self.model.eval()
             start = time.time()
+            eval_loader = self.test_data if self.use_test_for_validation else self.validation_data
+            eval_state = 'test' if self.use_test_for_validation else 'val'
+            eval_label = 'Test' if self.use_test_for_validation else 'Valid'
             with torch.no_grad():
-                val_loss = self._run_one_epoch(data_loader = self.validation_data, state='val')
+                val_loss, _ = self._run_one_epoch(data_loader=eval_loader, state=eval_state)
                 if self.args.distributed: val_loss = self._reduce_tensor(val_loss)
-            if self.print: print('Valid Summary | End of Epoch {0} | Time {1:.2f}s | '
-                      'Valid Loss {2:.3f}'.format(
+            if self.print: print('{0} Summary | End of Epoch {1} | Time {2:.2f}s | '
+                      '{0} Loss {3:.3f}'.format(
+                          eval_label,
                           self.epoch, time.time() - start, val_loss))
 
 
             # Test
-            self.model.eval()
-            start = time.time()
-            with torch.no_grad():
-                test_loss = self._run_one_epoch(data_loader = self.test_data, state='test')
-                if self.args.distributed: test_loss = self._reduce_tensor(test_loss)
-            if self.print: print('Test Summary | End of Epoch {0} | Time {1:.2f}s | '
-                      'Test Loss {2:.3f}'.format(
-                          self.epoch, time.time() - start, test_loss))
+            test_loss = val_loss
+            if not self.use_test_for_validation:
+                self.model.eval()
+                start = time.time()
+                with torch.no_grad():
+                    test_loss, _ = self._run_one_epoch(data_loader=self.test_data, state='test')
+                    if self.args.distributed: test_loss = self._reduce_tensor(test_loss)
+                if self.print: print('Test Summary | End of Epoch {0} | Time {1:.2f}s | '
+                          'Test Loss {2:.3f}'.format(
+                              self.epoch, time.time() - start, test_loss))
 
 
             # Check whether to early stop and to reduce learning rate
@@ -167,9 +216,16 @@ class Solver(object):
 
             if self.print:
                 # Tensorboard logging
-                self.writer.add_scalar('Train_loss', tr_loss, self.epoch)
-                self.writer.add_scalar('Validation_loss', val_loss, self.epoch)
-                self.writer.add_scalar('Test_loss', test_loss, self.epoch)
+                self.writer.add_scalar('Train/Loss_epoch', tr_loss, self.epoch)
+                self.writer.add_scalar('Test/Loss_epoch', test_loss, self.epoch)
+                self.writer.add_scalar('Train/Learning_rate_epoch', self._current_lr(), self.epoch)
+                self.writer.add_scalar('Train/Optimization_steps_total', self.optim_step, self.epoch)
+                self.writer.add_scalar('Train/Optimization_steps_epoch', train_stats['optimizer_steps'], self.epoch)
+                if train_stats['grad_norm_count'] > 0:
+                    self.writer.add_scalar('Train/Grad_norm_epoch_avg', train_stats['grad_norm_avg'], self.epoch)
+                    self.writer.add_scalar('Train/Grad_norm_epoch_max', train_stats['grad_norm_max'], self.epoch)
+                if not self.use_test_for_validation:
+                    self.writer.add_scalar('Validation/Loss_epoch', val_loss, self.epoch)
 
                 self._save_model(self.args.checkpoint_dir+"/last_checkpoint.pt")
                 if find_best_model:
@@ -179,38 +235,83 @@ class Solver(object):
 
     def _run_one_epoch(self, data_loader, state='train'):
         total_loss = 0
+        running_loss_total = 0.0
         self.accu_count = 0
+        accum_steps = int(self.args.effec_batch_size / self.args.batch_size) if self.args.accu_grad else 1
+        step_loss_total = 0.0
+        step_loss_count = 0
+        grad_norm_total = 0.0
+        grad_norm_max = 0.0
+        grad_norm_count = 0
+        optimizer_steps = 0
         self.optimizer.zero_grad()
-        for i, (a_mix, a_tgt, ref_tgt) in enumerate(data_loader):
+        progress = tqdm(
+            data_loader,
+            total=len(data_loader),
+            desc=f'Epoch {self.epoch} {state.capitalize()}',
+            leave=False,
+            disable=not self.print,
+        )
+        for i, (a_mix, a_tgt, ref_tgt) in enumerate(progress):
             a_mix = a_mix.to(self.args.device)
-            a_tgt = a_tgt.to(self.args.device)
+            a_tgt = a_tgt.to(self.args.device).float()
             
-            a_tgt_est = self.model(a_mix, ref_tgt)
-            loss = self.loss(a_tgt, a_tgt_est)
+            with self._autocast_context():
+                a_tgt_est = self.model(a_mix, ref_tgt)
+            loss = self.loss(a_tgt, self._to_loss_precision(a_tgt_est))
+            loss_value = self._to_float(loss)
+            running_loss_total += loss_value
 
             if state=='train':
                 if self.args.accu_grad:
                     self.accu_count += 1
+                    step_loss_total += loss_value
+                    step_loss_count += 1
                     loss_scaled = loss/(self.args.effec_batch_size / self.args.batch_size)
                     loss_scaled.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                    if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                    grad_norm_value = self._to_float(grad_norm)
+                    if self.accu_count == accum_steps:
                         if self.args.lr_warmup: self._adjust_lr_warmup()
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         self.accu_count = 0
+                        optimizer_steps += 1
+                        grad_norm_total += grad_norm_value
+                        grad_norm_max = max(grad_norm_max, grad_norm_value)
+                        grad_norm_count += 1
+                        self._log_optimizer_step(step_loss_total / max(1, step_loss_count), grad_norm_value)
+                        step_loss_total = 0.0
+                        step_loss_count = 0
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                    grad_norm_value = self._to_float(grad_norm)
                     if self.args.lr_warmup: self._adjust_lr_warmup()
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    optimizer_steps += 1
+                    grad_norm_total += grad_norm_value
+                    grad_norm_max = max(grad_norm_max, grad_norm_value)
+                    grad_norm_count += 1
+                    self._log_optimizer_step(loss_value, grad_norm_value)
 
-            # print(loss)
+            if self.print and (((i + 1) % 10 == 0) or (i + 1 == len(data_loader))):
+                postfix = {'loss': f'{running_loss_total / (i + 1):.3f}'}
+                if state == 'train':
+                    postfix['lr'] = f'{self._current_lr():.2e}'
+                    postfix['steps'] = optimizer_steps
+                progress.set_postfix(postfix)
 
             total_loss += loss.clone().detach()
-            
-        return total_loss / (i+1)
+
+        stats = {
+            'optimizer_steps': optimizer_steps,
+            'grad_norm_count': grad_norm_count,
+            'grad_norm_avg': (grad_norm_total / grad_norm_count) if grad_norm_count > 0 else 0.0,
+            'grad_norm_max': grad_norm_max,
+        }
+        return total_loss / (i+1), stats
 
     def _reduce_tensor(self, tensor):
         if not self.args.distributed: return tensor
@@ -225,15 +326,32 @@ class Solver(object):
         avg_sdri = 0
         avg_pesqi = 0
         avg_stoii = 0
+        if self.args.audio_sr == 8000:
+            pesq_mode = 'nb'
+        elif self.args.audio_sr == 16000:
+            pesq_mode = 'wb'
+        else:
+            raise ValueError(
+                f'PESQ evaluation only supports 8000 Hz or 16000 Hz audio, got {self.args.audio_sr}.')
 
         self._load_model(f'{self.args.checkpoint_dir}/last_best_checkpoint.pt')
         self.model.eval()
         with torch.no_grad():
-            for i, (a_mix, a_tgt, ref_tgt) in enumerate(data_loader):
+            progress = tqdm(
+                data_loader,
+                total=len(data_loader),
+                desc='Final Eval',
+                leave=False,
+                disable=not self.print,
+            )
+            for i, (a_mix, a_tgt, ref_tgt) in enumerate(progress):
                 a_mix = a_mix.to(self.args.device)
-                a_tgt = a_tgt.to(self.args.device)
+                a_tgt = a_tgt.to(self.args.device).float()
 
-                a_tgt_est = self.model(a_mix, ref_tgt)
+                with self._autocast_context():
+                    a_tgt_est = self.model(a_mix, ref_tgt)
+                a_tgt_est = a_tgt_est.float()
+                a_mix = a_mix.float()
 
                 if self.args.loss_type == 'ss_sisdr':
                     a_tgt = a_tgt[:,0,:]
@@ -249,12 +367,22 @@ class Solver(object):
                 sdri = SDR(a_tgt, a_tgt_est) - SDR(a_tgt, a_mix)
                 avg_sdri += sdri
 
-                a_tgt_est = a_tgt_est/np.max(np.abs(a_tgt_est))
-                pesqi =  (pesq(self.args.audio_sr, a_tgt, a_tgt_est, 'wb') - pesq(self.args.audio_sr, a_tgt, a_mix, 'wb'))
+                a_tgt_est = a_tgt_est / max(np.max(np.abs(a_tgt_est)), 1e-8)
+                a_mix = a_mix / max(np.max(np.abs(a_mix)), 1e-8)
+                pesqi = (
+                    pesq(self.args.audio_sr, a_tgt, a_tgt_est, pesq_mode)
+                    - pesq(self.args.audio_sr, a_tgt, a_mix, pesq_mode)
+                )
                 avg_pesqi += pesqi
 
                 stoii = (stoi(a_tgt, a_tgt_est, self.args.audio_sr, extended=False) - stoi(a_tgt, a_mix, self.args.audio_sr, extended=False))
                 avg_stoii += stoii
+
+                if self.print and (((i + 1) % 10 == 0) or (i + 1 == len(data_loader))):
+                    progress.set_postfix({
+                        'sisnri': f'{self._to_float(avg_sisnri / (i + 1)):.3f}',
+                        'sdri': f'{self._to_float(avg_sdri / (i + 1)):.3f}',
+                    })
 
 
         avg_sisnri = avg_sisnri / (i+1)
@@ -267,5 +395,3 @@ class Solver(object):
         print(f'Avg SNRi: {avg_sdri}')
         print(f'Avg PESQi: {avg_pesqi}')
         print(f'Avg STOIi: {avg_stoii}')
-
-

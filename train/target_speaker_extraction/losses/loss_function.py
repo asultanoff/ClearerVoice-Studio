@@ -39,6 +39,9 @@ class loss_wrapper(_Loss):
         return loss
     
     def spex_plus_loss(self, clean, estimate):
+        if not isinstance(estimate, (tuple, list)):
+            return 0 - torch.mean(cal_SISNR(clean, estimate))
+
         ests, ests2, ests3, spk_pred, speakers = estimate
         loss = 0 - torch.mean(cal_SISNR(clean, ests))
         if torch.sum(speakers) >=0:

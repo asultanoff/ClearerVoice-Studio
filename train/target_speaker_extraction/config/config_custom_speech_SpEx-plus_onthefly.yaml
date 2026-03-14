@@ -17,7 +17,7 @@ speech_train_direc: /home/asultanov/drives/jobs/hanny_ai/new_kurator/.cache/diar
 # speech_val_direc: /home/asultanov/drives/jobs/hanny_ai/new_kurator/.cache/diarization/uz_longform/artifacts/non_overlaps/val
 speech_test_direc: /home/asultanov/drives/jobs/hanny_ai/new_kurator/.cache/diarization/uz_longform/artifacts/non_overlaps/test
 speech_glob_pattern: "*.flac"
-speech_samples_per_epoch: 200
+speech_samples_per_epoch: 400000
 speech_min_snr_db: -5
 speech_max_snr_db: 5
 speech_ref_max_length: 2.5
@@ -29,9 +29,9 @@ hf_private: 1
 
 # dataloader
 num_workers: 24
-batch_size: 16
-accu_grad: 4
-effec_batch_size: 64
+batch_size: 64
+accu_grad: 2
+effec_batch_size: 128
 max_length: 2
 
 # network settings
@@ -55,5 +55,5 @@ network_audio:
 # optimizer
 loss_type: SpEx-plus
 init_learning_rate: 0.005
-max_epoch: 2
+max_epoch: 200
 clip_grad_norm: 5
